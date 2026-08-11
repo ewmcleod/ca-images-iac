@@ -1,0 +1,4 @@
+accounts:
+   run-as: "root"
+annotations:
+  "com.acme.business-unit": "payments"   # must equal the BU repo variable
