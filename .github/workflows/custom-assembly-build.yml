@@ -223,11 +223,17 @@ jobs:
           fi
           echo "Found $CERT_COUNT additional CA certificate(s)."
 
-          # Snapshot existing report IDs so the wait step can identify this apply's build(s).
+          # Snapshot existing report IDs so the wait step can identify this
+          # apply's build(s). No fallback here — this workflow customizes
+          # Chainguard-managed base images in place, so the target always
+          # exists and a non-zero exit from chainctl is a real error worth
+          # failing on rather than swallowing (a silent empty snapshot would
+          # let the wait step confuse historical reports with this apply's).
+          # `(.reports // [])` covers a repo that exists but has no build
+          # history yet.
           BEFORE_IDS=$(chainctl images repos build list \
             --parent "$CHAINGUARD_ORG" --repo "$CHAINGUARD_REPO" \
-            --output json 2>/dev/null | jq -c '[.reports[].id]' || echo '[]')
-          BEFORE_IDS=${BEFORE_IDS:-[]}
+            --output json | jq -c '[(.reports // [])[].id]')
           echo "before_ids=$BEFORE_IDS" >> "$GITHUB_OUTPUT"
 
           set +e
