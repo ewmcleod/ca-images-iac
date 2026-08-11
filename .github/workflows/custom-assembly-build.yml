@@ -18,6 +18,9 @@ name: Custom Assembly Build
 
 on:
   # push:
+  #   # Restrict to main so branch pushes don't trigger real Chainguard builds
+  #   # against the shared org. Uncomment/adjust alongside the push: block.
+  #   branches: [main]
   #   paths:
   #     # WARNING: keep in sync with env.IMAGES_DIR below — `on:` can't reference
   #     # env, so update both by hand or image changes will stop triggering.
@@ -31,6 +34,15 @@ on:
 
 # Least privilege at the top; each job widens only what it needs.
 permissions: {}
+
+# Serialize runs targeting the same ref. This workflow customizes Chainguard
+# repos in place, so two overlapping runs would race `chainctl build apply`
+# against the same target and confuse the "diff report IDs before/after apply"
+# wait logic. Keep cancel-in-progress: false so a queued run waits its turn
+# instead of aborting a build already talking to Chainguard.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
   # Root directory holding one <name>.yaml Custom Assembly config per image
@@ -67,6 +79,9 @@ jobs:
 
       - name: Build matrix from image configs
         id: set
+        env:
+          CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG }}
+          CHAINGUARD_IDENTITY: ${{ vars.CHAINGUARD_IDENTITY }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -78,8 +93,8 @@ jobs:
           # variables in repo Settings → Variables and configure an assumable
           # OIDC identity in your Chainguard organization.
           MISSING=()
-          if [ -z "${{ vars.CHAINGUARD_ORG }}" ];      then MISSING+=("CHAINGUARD_ORG"); fi
-          if [ -z "${{ vars.CHAINGUARD_IDENTITY }}" ]; then MISSING+=("CHAINGUARD_IDENTITY"); fi
+          if [ -z "$CHAINGUARD_ORG" ];      then MISSING+=("CHAINGUARD_ORG"); fi
+          if [ -z "$CHAINGUARD_IDENTITY" ]; then MISSING+=("CHAINGUARD_IDENTITY"); fi
           if [ ${#MISSING[@]} -gt 0 ]; then
             DOCS="https://edu.chainguard.dev/chainguard/administration/iam-organizations/assumable-ids/identity-examples/github-actions-identity/"
             echo "::warning::Skipping build — required variable(s) not set: ${MISSING[*]}. Set them in Settings → Variables. See $DOCS"
@@ -112,13 +127,19 @@ jobs:
           # drops the globs when nothing matches, so an empty dir yields none).
           # The name is customized in place — both <name>.yaml and <name>.yml
           # present is an error and skips that image.
-          names=$(
+          #
+          # Read into a bash array and iterate with "${names[@]}" so a filename
+          # containing whitespace can't be word-split into bogus entries by the
+          # default IFS (shellcheck SC2086). printf keeps names starting with
+          # '-' or containing backslashes intact.
+          mapfile -t names < <(
             for f in "$IMAGES_DIR"/*.yaml "$IMAGES_DIR"/*.yml; do
-              b=$(basename "$f"); echo "${b%.*}"
+              b=$(basename "$f")
+              printf '%s\n' "${b%.*}"
             done | sort -u
           )
           entries=()
-          for name in $names; do
+          for name in "${names[@]}"; do
             resolved=$(resolve_yaml "$IMAGES_DIR/$name") && rc=0 || rc=$?
             if [ "$rc" -eq 2 ]; then
               echo "::error::$IMAGES_DIR has both ${name}.yaml and ${name}.yml — keep one. Skipping."; continue
@@ -159,10 +180,9 @@ jobs:
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     env:
-      CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG || 'trineta.net' }}
+      CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG }}
       CHAINGUARD_REPO: ${{ matrix.name }}      # image customized in place (== base)
       CONFIG_FILE: ${{ matrix.config }}        # pure Custom Assembly config
-      # CERTS_DIR is global (workflow-level env), not per-image.
 
     steps:
       - name: Checkout
@@ -218,7 +238,12 @@ jobs:
             exit "$APPLY_RC"
           fi
 
-          if echo "$APPLY_OUT" | grep -q "No changes detected"; then
+          # Anchor the match to the exact chainctl "no changes" line rather than
+          # a bare substring, so an unrelated build-log line containing that
+          # phrase can't accidentally short-circuit the wait step. If chainctl
+          # ever reworders this message, the wait step below will time out with
+          # a loud "timed out after 10m" error rather than silently skipping.
+          if echo "$APPLY_OUT" | grep -qE "^No changes detected in build config for "; then
             echo "Image already up to date — no new build triggered."
             echo "skipped=true" >> "$GITHUB_OUTPUT"
           else
@@ -230,9 +255,10 @@ jobs:
       # concurrent/historical builds don't confuse completion detection.
       - name: Wait for build to complete
         if: steps.customize.outputs.skipped != 'true'
+        env:
+          BEFORE_IDS: ${{ steps.customize.outputs.before_ids }}
         run: |
           set -euo pipefail
-          BEFORE_IDS='${{ steps.customize.outputs.before_ids }}'
 
           list_reports() {
             chainctl images repos build list \

@@ -12,6 +12,9 @@ name: Custom Assembly Build - BU
 
 on:
   push:
+    # Restrict to main so branch/PR pushes don't trigger real Chainguard
+    # builds against the shared org. Use workflow_dispatch to run ad-hoc.
+    branches: [main]
     paths:
       # WARNING: keep in sync with env.IMAGES_DIR below — `on:` can't reference
       # env, so update both by hand or image changes will stop triggering.
@@ -25,6 +28,15 @@ on:
 
 # Least privilege at the top; each job widens only what it needs.
 permissions: {}
+
+# Serialize runs targeting the same ref+BU. This workflow updates the same
+# "<image>-<BU>" variant repos in place, so two overlapping runs would race
+# `chainctl build apply` against the same target and confuse the "diff report
+# IDs before/after apply" wait logic. Keep cancel-in-progress: false so a
+# queued run waits its turn instead of aborting a build already in flight.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ vars.BU }}
+  cancel-in-progress: false
 
 env:
   # Root directory holding one <name>.yaml Custom Assembly config per image
@@ -61,6 +73,10 @@ jobs:
 
       - name: Build matrix from image directories
         id: set
+        env:
+          CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG }}
+          CHAINGUARD_IDENTITY: ${{ vars.CHAINGUARD_IDENTITY }}
+          BU: ${{ vars.BU }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -72,8 +88,8 @@ jobs:
           # variables in repo Settings → Variables and configure an assumable
           # OIDC identity in your Chainguard organization.
           MISSING=()
-          if [ -z "${{ vars.CHAINGUARD_ORG }}" ];      then MISSING+=("CHAINGUARD_ORG"); fi
-          if [ -z "${{ vars.CHAINGUARD_IDENTITY }}" ]; then MISSING+=("CHAINGUARD_IDENTITY"); fi
+          if [ -z "$CHAINGUARD_ORG" ];      then MISSING+=("CHAINGUARD_ORG"); fi
+          if [ -z "$CHAINGUARD_IDENTITY" ]; then MISSING+=("CHAINGUARD_IDENTITY"); fi
           if [ ${#MISSING[@]} -gt 0 ]; then
             DOCS="https://edu.chainguard.dev/chainguard/administration/iam-organizations/assumable-ids/identity-examples/github-actions-identity/"
             echo "::warning::Skipping build — required variable(s) not set: ${MISSING[*]}. Set them in Settings → Variables. See $DOCS"
@@ -95,7 +111,6 @@ jobs:
           # Business-unit tag appended to the target variant repo name — REQUIRED.
           # Each image builds into "<dir-name>-<BU>". Set BU in repo Settings →
           # Variables; the workflow fails here if it is missing.
-          BU='${{ vars.BU }}'
           if [ -z "$BU" ]; then
             echo "::error::BU repo variable is not set — set it in Settings → Variables. Aborting."
             exit 1
@@ -119,13 +134,19 @@ jobs:
           # job (so one bad config fails only its own image, not the whole matrix).
           # Unique image names from the flat <name>.yaml/.yml configs (nullglob
           # drops the globs when nothing matches, so an empty dir yields none).
-          names=$(
+          #
+          # Read into a bash array and iterate with "${names[@]}" so a filename
+          # containing whitespace can't be word-split into bogus entries by the
+          # default IFS (shellcheck SC2086). printf keeps names starting with
+          # '-' or containing backslashes intact.
+          mapfile -t names < <(
             for f in "$IMAGES_DIR"/*.yaml "$IMAGES_DIR"/*.yml; do
-              b=$(basename "$f"); echo "${b%.*}"
+              b=$(basename "$f")
+              printf '%s\n' "${b%.*}"
             done | sort -u
           )
           entries=()
-          for name in $names; do
+          for name in "${names[@]}"; do
             resolved=$(resolve_yaml "$IMAGES_DIR/$name") && rc=0 || rc=$?
             if [ "$rc" -eq 2 ]; then
               echo "::error::$IMAGES_DIR has both ${name}.yaml and ${name}.yml — keep one. Skipping."; continue
@@ -169,12 +190,11 @@ jobs:
       matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
 
     env:
-      CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG || 'trineta.net' }}
+      CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG }}
       CHAINGUARD_BASE: ${{ matrix.base }}      # Chainguard image being customized (dir name)
       CHAINGUARD_REPO: ${{ matrix.target }}    # repo built & tracked (<base>-<BU>)
       CONFIG_FILE: ${{ matrix.config }}        # pure Custom Assembly config
       CHAINGUARD_BU: ${{ vars.BU }}            # required business-unit tag; must match the config annotation
-      # CERTS_DIR is global (workflow-level env), not per-image.
 
     steps:
       - name: Checkout
@@ -193,9 +213,12 @@ jobs:
             echo "::error::BU repo variable is not set — set it in Settings → Variables. Aborting."
             exit 1
           fi
+          # Use [.] (character class) rather than \. — \. is not a defined
+          # JSON string escape, so its meaning inside jq/yq's regex string is
+          # implementation-dependent. The character class is portable.
           mapfile -t bu_vals < <(
             yq '(.annotations // {}) | to_entries[]
-                  | select(.key | test("(^|\.)business-unit$")) | .value' "$CONFIG_FILE" 2>/dev/null \
+                  | select(.key | test("(^|[.])business-unit$")) | .value' "$CONFIG_FILE" 2>/dev/null \
               | sort -u
           )
           if [ "${#bu_vals[@]}" -eq 0 ]; then
@@ -231,10 +254,18 @@ jobs:
           # so it's used only for the variant's first build:
           #   - <base>-<BU> target exists: update the variant in place
           #   - <base>-<BU> target missing: create it from the base via --save-as
+          #
+          # Probe with `chainctl images repos list`, not `... build list`.
+          # `images repos list` exits 0 for both outcomes and just returns an
+          # empty `.items` array when the repo doesn't exist — so a transient
+          # non-zero exit (auth blip, network) fails loudly under `set -e`
+          # instead of being misread as "repo doesn't exist" and misrouting
+          # us into `--save-as` against a repo that already exists.
           ARGS=( images repos build apply --parent "$CHAINGUARD_ORG" --file "$CONFIG_FILE" --yes )
-          if chainctl images repos build list \
-                 --parent "$CHAINGUARD_ORG" --repo "$CHAINGUARD_REPO" \
-                 --output json >/dev/null 2>&1; then
+          EXISTS=$(chainctl images repos list \
+                     --parent "$CHAINGUARD_ORG" --repo "$CHAINGUARD_REPO" \
+                     --output json | jq '.items | length')
+          if [ "$EXISTS" -gt 0 ]; then
             echo "Updating existing variant '$CHAINGUARD_REPO'."
             ARGS+=( --repo "$CHAINGUARD_REPO" )
           else
@@ -277,7 +308,12 @@ jobs:
             exit "$APPLY_RC"
           fi
 
-          if echo "$APPLY_OUT" | grep -q "No changes detected"; then
+          # Anchor the match to the exact chainctl "no changes" line rather than
+          # a bare substring, so an unrelated build-log line containing that
+          # phrase can't accidentally short-circuit the wait step. If chainctl
+          # ever reworders this message, the wait step below will time out with
+          # a loud "timed out after 10m" error rather than silently skipping.
+          if echo "$APPLY_OUT" | grep -qE "^No changes detected in build config for "; then
             echo "Image already up to date — no new build triggered."
             echo "skipped=true" >> "$GITHUB_OUTPUT"
           else
@@ -289,9 +325,10 @@ jobs:
       # concurrent/historical builds don't confuse completion detection.
       - name: Wait for build to complete
         if: steps.customize.outputs.skipped != 'true'
+        env:
+          BEFORE_IDS: ${{ steps.customize.outputs.before_ids }}
         run: |
           set -euo pipefail
-          BEFORE_IDS='${{ steps.customize.outputs.before_ids }}'
 
           # Tolerate a transient/just-created repo: a save-as variant's first
           # build isn't immediately listable, and `build list` exits non-zero
