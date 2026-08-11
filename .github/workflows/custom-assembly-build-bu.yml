@@ -110,8 +110,7 @@ jobs:
 
           # Business-unit tag appended to the target variant repo name — REQUIRED.
           # Each image builds into "<dir-name>-<BU>". Set BU in repo Settings →
-          # Variables; the workflow fails here if it is missing. BU is bound via
-          # the step's env: block (see hardening note above).
+          # Variables; the workflow fails here if it is missing.
           if [ -z "$BU" ]; then
             echo "::error::BU repo variable is not set — set it in Settings → Variables. Aborting."
             exit 1
