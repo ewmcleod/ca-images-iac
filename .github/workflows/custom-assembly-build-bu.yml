@@ -59,6 +59,7 @@ jobs:
   discover:
     name: Discover images
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: read
     outputs:
@@ -182,6 +183,7 @@ jobs:
     # is invalid ("matrix must define at least one vector") and would error.
     if: needs.discover.outputs.has_images == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     permissions:
       contents: read
       id-token: write     # OIDC auth with chainctl
@@ -194,7 +196,7 @@ jobs:
       CHAINGUARD_BASE: ${{ matrix.base }}      # Chainguard image being customized (dir name)
       CHAINGUARD_REPO: ${{ matrix.target }}    # repo built & tracked (<base>-<BU>)
       CONFIG_FILE: ${{ matrix.config }}        # pure Custom Assembly config
-      CHAINGUARD_BU: ${{ vars.BU }}            # required business-unit tag; must match the config annotation
+      BU: ${{ vars.BU }}                       # required business-unit tag; must match the config annotation
 
     steps:
       - name: Checkout
@@ -209,10 +211,8 @@ jobs:
       - name: Verify business-unit annotation matches BU
         run: |
           set -euo pipefail
-          if [ -z "$CHAINGUARD_BU" ]; then
-            echo "::error::BU repo variable is not set — set it in Settings → Variables. Aborting."
-            exit 1
-          fi
+          # BU non-empty is already enforced in the discover job; this step
+          # only runs when discover succeeded, so no re-check needed here.
           # Use [.] (character class) rather than \. — \. is not a defined
           # JSON string escape, so its meaning inside jq/yq's regex string is
           # implementation-dependent. The character class is portable.
@@ -222,17 +222,17 @@ jobs:
               | sort -u
           )
           if [ "${#bu_vals[@]}" -eq 0 ]; then
-            echo "::error::$CONFIG_FILE has no '*business-unit' annotation (must equal BU='$CHAINGUARD_BU'). Aborting."
+            echo "::error::$CONFIG_FILE has no '*business-unit' annotation (must equal BU='$BU'). Aborting."
             exit 1
           elif [ "${#bu_vals[@]}" -gt 1 ]; then
             echo "::error::$CONFIG_FILE has conflicting business-unit annotations (${bu_vals[*]}) — keep one. Aborting."
             exit 1
           fi
-          if [ "${bu_vals[0]}" != "$CHAINGUARD_BU" ]; then
-            echo "::error::$CONFIG_FILE business-unit='${bu_vals[0]}' but repo variable BU='$CHAINGUARD_BU' — they must match. Aborting."
+          if [ "${bu_vals[0]}" != "$BU" ]; then
+            echo "::error::$CONFIG_FILE business-unit='${bu_vals[0]}' but repo variable BU='$BU' — they must match. Aborting."
             exit 1
           fi
-          echo "business-unit '$CHAINGUARD_BU' verified for $CONFIG_FILE."
+          echo "business-unit '$BU' verified for $CONFIG_FILE."
 
       - name: Setup chainctl
         uses: chainguard-dev/setup-chainctl@2cddd35a2f120d9973e58094dc6878c93cf58c28 # v0.5.1
@@ -249,18 +249,28 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Pick the apply mode. The target is always the "<base>-<BU>" variant.
-          # `--save-as` CREATES a new variant repo and errors if it already exists,
-          # so it's used only for the variant's first build:
-          #   - <base>-<BU> target exists: update the variant in place
-          #   - <base>-<BU> target missing: create it from the base via --save-as
+          # Pick the apply mode and snapshot "before" build report IDs in a
+          # single branch — the two decisions are tightly coupled:
+          #   - target exists  → update in place; snapshot current report IDs
+          #                      so the wait step can identify only this
+          #                      apply's new build(s).
+          #   - target missing → create via --save-as; the snapshot is
+          #                      trivially empty (no prior reports possible),
+          #                      which also avoids a needless `build list`
+          #                      call against a nonexistent repo.
           #
-          # Probe with `chainctl images repos list`, not `... build list`.
-          # `images repos list` exits 0 for both outcomes and just returns an
-          # empty `.items` array when the repo doesn't exist — so a transient
+          # `--save-as` CREATES a new variant repo and errors if it already
+          # exists, so it's used only for the variant's first build.
+          #
+          # Probe existence with `chainctl images repos list`, not `... build
+          # list`. `images repos list` exits 0 for both "exists" (non-empty
+          # .items) and "doesn't exist" (empty .items), so a transient
           # non-zero exit (auth blip, network) fails loudly under `set -e`
           # instead of being misread as "repo doesn't exist" and misrouting
-          # us into `--save-as` against a repo that already exists.
+          # into `--save-as` against a repo that already exists.
+          # `(.reports // [])` in the snapshot defensively handles a repo
+          # that exists but has no build history — e.g. one created manually
+          # via the UI.
           ARGS=( images repos build apply --parent "$CHAINGUARD_ORG" --file "$CONFIG_FILE" --yes )
           EXISTS=$(chainctl images repos list \
                      --parent "$CHAINGUARD_ORG" --repo "$CHAINGUARD_REPO" \
@@ -268,10 +278,15 @@ jobs:
           if [ "$EXISTS" -gt 0 ]; then
             echo "Updating existing variant '$CHAINGUARD_REPO'."
             ARGS+=( --repo "$CHAINGUARD_REPO" )
+            BEFORE_IDS=$(chainctl images repos build list \
+              --parent "$CHAINGUARD_ORG" --repo "$CHAINGUARD_REPO" \
+              --output json | jq -c '[(.reports // [])[].id]')
           else
             echo "Creating variant '$CHAINGUARD_REPO' from base '$CHAINGUARD_BASE'."
             ARGS+=( --repo "$CHAINGUARD_BASE" --save-as "$CHAINGUARD_REPO" )
+            BEFORE_IDS='[]'
           fi
+          echo "before_ids=$BEFORE_IDS" >> "$GITHUB_OUTPUT"
 
           # Discover additional CA certificates and add a flag for each.
           CERT_COUNT=0
@@ -287,16 +302,6 @@ jobs:
             echo "No certificate directory '${CERTS_DIR:-<none>}' — building without extra CAs."
           fi
           echo "Found $CERT_COUNT additional CA certificate(s)."
-
-          # Snapshot existing report IDs so the wait step can identify this apply's build(s).
-          # A brand-new repo has no build history yet — `build list` exits non-zero,
-          # which under `set -e`/`pipefail` would abort before the apply that creates
-          # it. Tolerate that by defaulting to an empty array.
-          BEFORE_IDS=$(chainctl images repos build list \
-            --parent "$CHAINGUARD_ORG" --repo "$CHAINGUARD_REPO" \
-            --output json 2>/dev/null | jq -c '[.reports[].id]' || echo '[]')
-          BEFORE_IDS=${BEFORE_IDS:-[]}
-          echo "before_ids=$BEFORE_IDS" >> "$GITHUB_OUTPUT"
 
           set +e
           APPLY_OUT=$(chainctl "${ARGS[@]}" 2>&1)
