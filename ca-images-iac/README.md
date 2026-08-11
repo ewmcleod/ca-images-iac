@@ -34,7 +34,7 @@ variables → Actions → **Variables**):
 gracefully** (green, no build). If `BU` is missing, it **fails**.
 
 Configure the assumable identity following Chainguard's guide:
-<https://edu.chainguard.dev/chainguard/administration/iam-organizations/assumable-ids/identity-examples/github-actions-identity/>
+<https://edu.chainguard.dev/platform/administration/assumable-ids/identity-examples/github-identity/>
 
 ---
 
