@@ -10,7 +10,7 @@ GitHub Actions workflows discover the image configs in this repo, apply each one
 
 | Path | What it is |
 | --- | --- |
-| [`.github/workflows/custom-assembly-bu.yml`](.github/workflows/custom-assembly-bu.yml) | **Per–business-unit variants** (default, push-triggered). |
+| [`.github/workflows/custom-assembly-build-bu.yml`](.github/workflows/custom-assembly-build-bu.yml) | **Per–business-unit variants** (default, push-triggered). |
 | [`.github/workflows/custom-assembly-build.yml`](.github/workflows/custom-assembly-build.yml) | **In-place customization** (manual `workflow_dispatch`). |
 | [`ca-images-iac/`](ca-images-iac/) | One `<name>.yaml` Custom Assembly config per image. |
 | [`ca-images-iac/README.md`](ca-images-iac/README.md) | **Full usage guide** — setup, layout, the business-unit annotation, troubleshooting. |
@@ -36,7 +36,7 @@ Rebuilds each base image **in place** — the source and the built repo are both
   config YAML. Once that's available, this can produce a copy instead of
   overwriting in place.
 
-### `custom-assembly-bu.yml` — per–business-unit variants
+### `custom-assembly-build-bu.yml` — per–business-unit variants
 
 Builds a **variant** repo `<name>-<BU>` from each `<name>` base, where `BU` is a
 required repository variable. The base image is never modified. Requires each

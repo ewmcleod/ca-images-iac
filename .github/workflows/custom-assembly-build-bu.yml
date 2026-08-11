@@ -20,7 +20,7 @@ on:
       # before any env exists, so this literal can't reference it — they must be
       # updated together by hand or cert changes will silently stop triggering.
       - certs/**
-      - .github/workflows/custom-assembly-bu.yml
+      - .github/workflows/custom-assembly-build-bu.yml
   workflow_dispatch:
 
 # Least privilege at the top; each job widens only what it needs.

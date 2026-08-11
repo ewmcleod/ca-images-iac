@@ -1,7 +1,7 @@
 # Custom Assembly Build — BU pipeline
 
 This directory is the source of truth for the
-[`.github/workflows/custom-assembly-bu.yml`](../.github/workflows/custom-assembly-bu.yml)
+[`.github/workflows/custom-assembly-build-bu.yml`](../.github/workflows/custom-assembly-build-bu.yml)
 workflow (**"Custom Assembly Build - BU"**). The workflow customizes Chainguard
 images with [Custom Assembly](https://edu.chainguard.dev/chainguard/chainguard-images/features/ca-docs/custom-assembly-chainctl/)
 and builds a per–business-unit **variant** of each one.

@@ -7,14 +7,14 @@ name: Custom Assembly Build
 # both the config filename (minus extension). There is no variant/`--save-as`
 # routing yet; when Custom Assembly configs support declaring a save-as target,
 # a variant mode can be added here. For per–business-unit variants today, use
-# custom-assembly-bu.yml instead.
+# custom-assembly-build-bu.yml instead.
 #
-# Manual trigger only: this and custom-assembly-bu.yml both operate on the same
+# Manual trigger only: this and custom-assembly-build-bu.yml both operate on the same
 # ca-images-iac/ configs, so leaving both on `push` would double-build (and this
-# one would overwrite the base images). custom-assembly-bu.yml owns the push
+# one would overwrite the base images). custom-assembly-build-bu.yml owns the push
 # trigger; run this one on demand via "Run workflow". To make it automatic,
 # uncomment the `push:` block below (and disable the push trigger in
-# custom-assembly-bu.yml so the two don't both fire).
+# custom-assembly-build-bu.yml so the two don't both fire).
 
 on:
   # push:
