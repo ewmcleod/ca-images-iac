@@ -268,6 +268,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Tolerate transient chainctl errors during polling. Any single
+          # failed `build list` call inside the loop should NOT fail the
+          # whole step (that would orphan the build we just triggered);
+          # returning empty JSON keeps the loop retrying until the report
+          # appears or the DEADLINE fires. Note this is different from the
+          # one-shot `BEFORE_IDS` snapshot above, which must fail loudly on
+          # chainctl errors so it can't silently miss the "before" state.
           list_reports() {
             chainctl images repos build list \
               --parent "$CHAINGUARD_ORG" --repo "$CHAINGUARD_REPO" \

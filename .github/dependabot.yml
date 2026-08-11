@@ -1,0 +1,19 @@
+# Dependabot — auto-open PRs to bump third-party GitHub Actions.
+#
+# Actions in this repo are pinned by full commit SHA (with a `# vX.Y.Z`
+# sidecar comment); Dependabot updates the SHA and the sidecar together so
+# the pinning stays accurate over time.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Group all updates into one PR per week to reduce review churn — this
+    # repo currently uses only a handful of third-party actions, so per-
+    # action PRs would produce more noise than signal.
+    groups:
+      actions:
+        patterns:
+          - "*"
