@@ -1,0 +1,16 @@
+# Example overlay — NOT applied (examples/ is not scanned).
+# Copy to ca-overlays/python-test-fips.yaml to activate.
+#
+# Templated package names: Chainguard expands {{major}}.{{minor}} per tag, so
+# each Python version gets its matching package (e.g. py3.13-cryptography on
+# the 3.13 tags). The names MUST be quoted — an unquoted leading `{` is parsed
+# by YAML as a flow mapping, not a string.
+contents:
+  packages:
+    - "py{{major}}.{{minor}}-cryptography"
+    - "py{{major}}.{{minor}}-grpcio-1.84"
+    - "py{{major}}.{{minor}}-psycopg2"
+
+bindings:
+  - repo: python-test-fips
+    all-tags: true

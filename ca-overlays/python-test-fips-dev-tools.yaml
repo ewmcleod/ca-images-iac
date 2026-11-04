@@ -1,0 +1,16 @@
+# Example overlay — NOT applied (examples/ is not scanned).
+# Copy to ca-overlays/python-test-fips-dev-tools.yaml to activate.
+#
+# Debug tooling for the -dev tags only. This is a separate overlay from
+# python-test-fips.yaml because an overlay can attach to a repo only once —
+# a different tag selector needs its own overlay. On -dev tags both apply:
+# the all-tags overlay is layered first, then this variant overlay, and their
+# package lists combine.
+contents:
+  packages:
+    - jq
+    - curl
+
+bindings:
+  - repo: python-test-fips
+    tag-variant: dev
