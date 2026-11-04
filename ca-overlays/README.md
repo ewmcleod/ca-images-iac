@@ -59,12 +59,21 @@ For each file:
    `detach` bindings of this overlay that the file no longer declares (set
    `PRUNE_BINDINGS` to anything other than `"true"` in `custom-assembly-overlay.yml`
    to only warn instead).
-3. **Rebuild check** — if step 1 or 2 changed anything, waits for the rebuilds
-   on each bound repo and fails if any tag stream's latest rebuild failed (e.g.
-   a templated package that doesn't exist for one Python version). Rebuilds
-   are matched by the overlay's digest annotation, which is copied into every
-   rebuilt image, so unrelated builds of the same repo are ignored. The job
-   summary shows a per-image result table. Tunables (`REBUILD_*`) are in the
+3. **Rebuild check** — one job after all overlays have reconciled. For every
+   repo where an overlay changed (step 1 or 2), it waits for the rebuilds and
+   fails if any tag stream's latest rebuild failed (e.g. a templated package
+   that doesn't exist for one Python version). Rebuilds are matched by each
+   overlay's digest annotation, which is copied into every rebuilt image, so
+   unrelated builds of the same repo are ignored.
+
+   It is checked **per repo**, not per overlay, because several overlays can
+   share a repo (e.g. an `all-tags` overlay plus a `tag-variant: dev` one):
+   Chainguard runs each overlay change as its own rebuild wave, one after
+   another per repo, so the second overlay's rebuilds can start many minutes
+   after its change. The check waits until every changed overlay on the repo
+   has produced a rebuild (or the repo has been idle for
+   `REBUILD_FIRST_REPORT_SECONDS`), and the summary table lists which changed
+   overlays each image's build carried. Tunables (`REBUILD_*`) are in the
    workflow's `env:`. `all-repos` bindings are not checked.
 
 Not handled: deleting the overlay when its file is removed. Detach its bindings
