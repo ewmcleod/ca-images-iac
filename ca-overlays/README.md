@@ -32,7 +32,7 @@ contents:
 environment:
   FOO: bar
 annotations:
-  "com.acme.business-unit": "sws-wai"   # optional, passed through as-is
+  "com.acme.business-unit": "payments"   # optional, passed through as-is
 
 bindings:
   - repo: python
