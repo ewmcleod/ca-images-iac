@@ -1,0 +1,19 @@
+# Example overlay — NOT applied (examples/ is not scanned).
+# Copy to ca-overlays/<name>.yaml to activate.
+#
+# Everything except `bindings:` is the overlay config, in the same shape
+# `chainctl images repos build apply` accepts. Global CA certs from certs/ are
+# added automatically.
+contents:
+  packages:
+    - gcsfuse
+    - fuse3
+    - gnupg
+
+# Where this overlay applies. One entry per target repo.
+#   target:   repo: <name>   |  all-repos: true   (every repo in the org)
+#   selector: all-tags: true |  tag-variant: dev  |  exact-tags: ["3.13", ...]
+# Quote exact tags — unquoted 3.10 is parsed as the number 3.1.
+bindings:
+  - repo: python
+    exact-tags: ["3.13", "3.13-dev"]

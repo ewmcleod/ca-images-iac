@@ -1,0 +1,7 @@
+contents:
+  packages:
+    - gcsfuse
+    - fuse3
+    - gnupg
+annotations:
+  "com.acme.business-unit": "legal"
