@@ -4,4 +4,4 @@ contents:
     - fuse3
     - gnupg
 annotations:
-  "com.acme.business-unit": "legal"
+  "com.acme.business-unit": "payments"
