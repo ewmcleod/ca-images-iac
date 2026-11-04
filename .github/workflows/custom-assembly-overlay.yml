@@ -50,10 +50,25 @@ env:
   # Global CA certificate directory — attached to EVERY overlay.
   CERTS_DIR: certs
 
-  # Annotation stamped into each overlay's stored config holding a sha256 of
-  # the desired config + certificates. Lets a re-run detect "unchanged" and skip
-  # `overlays update`, which would otherwise trigger needless rebuilds.
-  DIGEST_ANNOTATION: dev.ca-images-iac.overlay-digest
+  # Annotation stamped into each overlay's config holding a sha256 of the
+  # desired config + certificates. The full key is "<prefix>.<overlay-name>" —
+  # per overlay, because overlay annotations are copied into every rebuilt
+  # image's build config, and when several overlays layer onto one tag a shared
+  # key would be overwritten by the last layer. It serves two purposes:
+  #   - a re-run detects "unchanged" and skips `overlays update` (no rebuilds)
+  #   - the rebuild check identifies exactly which build reports this overlay
+  #     version produced
+  DIGEST_ANNOTATION_PREFIX: dev.ca-images-iac.overlay-digest
+
+  # Rebuild check (after any change that triggers rebuilds). Overlay changes
+  # fan out into one build per tag stream that start over several minutes, so
+  # "done" means: at least one matching report, none pending, and no new one
+  # for REBUILD_SETTLE_SECONDS. If no matching report appears within
+  # REBUILD_FIRST_REPORT_SECONDS the check warns and passes (e.g. an exact-tags
+  # binding to tags that don't exist yet produces no builds).
+  REBUILD_TIMEOUT_SECONDS: "1500"
+  REBUILD_FIRST_REPORT_SECONDS: "300"
+  REBUILD_SETTLE_SECONDS: "90"
 
   # "true": detach bindings of a managed overlay that the file no longer
   # declares (the file is the source of truth). Anything else: only warn.
@@ -145,7 +160,9 @@ jobs:
     needs: discover
     if: needs.discover.outputs.has_overlays == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Reconcile is seconds; the rest is the rebuild check
+    # (REBUILD_TIMEOUT_SECONDS = 25m) plus headroom.
+    timeout-minutes: 35
     permissions:
       contents: read
       id-token: write     # OIDC auth with chainctl
@@ -222,6 +239,7 @@ jobs:
           identity: ${{ vars.CHAINGUARD_IDENTITY }}
 
       - name: Reconcile overlay + bindings
+        id: reconcile
         env:
           DESIRED: ${{ steps.bindings.outputs.desired }}
         run: |
@@ -229,6 +247,11 @@ jobs:
           WORK=$(mktemp -d)
           ACTIONS=()
           note() { echo "$1"; ACTIONS+=("$1"); }
+          # Set when something changed that makes Chainguard rebuild tags with
+          # this overlay (create/update overlay, attach, update-binding). A
+          # detach alone doesn't: those rebuilds no longer carry the overlay.
+          CHANGED=false
+          DIGEST_KEY="${DIGEST_ANNOTATION_PREFIX}.${OVERLAY_NAME}"
 
           # ── Desired overlay config: the file minus `bindings` ──
           yq 'del(.bindings)' "$CONFIG_FILE" > "$WORK/config.yaml"
@@ -259,8 +282,26 @@ jobs:
               for c in "${CERTS[@]}"; do printf '%s\n' "$c"; sha256sum < "$c"; done
             } | sha256sum | cut -d' ' -f1
           )
-          DIGEST="$DIGEST" yq -i '.annotations[strenv(DIGEST_ANNOTATION)] = strenv(DIGEST)' "$WORK/config.yaml"
-          echo "Desired overlay digest: $DIGEST"
+          DIGEST="$DIGEST" DIGEST_KEY="$DIGEST_KEY" \
+            yq -i '.annotations[strenv(DIGEST_KEY)] = strenv(DIGEST)' "$WORK/config.yaml"
+          echo "Desired overlay digest: $DIGEST_KEY=$DIGEST"
+
+          # Snapshot existing build report IDs on every bound repo BEFORE any
+          # change, so the rebuild check only counts reports created after it.
+          # Fails loudly: a repo that can't be listed (typo, missing, no
+          # access) would also fail `attach`, and a silent empty snapshot would
+          # let historical reports be mistaken for this run's.
+          # all-repos bindings are not checked (unbounded repo set).
+          BEFORE='{}'
+          while IFS= read -r repo; do
+            [ -n "$repo" ] || continue
+            ids=$(chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
+                    --output json | jq -c '[(.reports // [])[].id]')
+            BEFORE=$(jq -c --arg r "$repo" --argjson ids "$ids" '. + {($r): $ids}' <<<"$BEFORE")
+          done < <(jq -r '.[] | select(.all_repos | not) | .repo' <<<"$DESIRED")
+          if jq -e 'any(.all_repos)' <<<"$DESIRED" >/dev/null; then
+            echo "::notice::$OVERLAY_NAME has an all-repos binding — its rebuilds are not checked."
+          fi
 
           list_overlay() {
             chainctl images overlays list --parent "$CHAINGUARD_ORG" -o json \
@@ -274,17 +315,19 @@ jobs:
               chainctl images overlays create "$OVERLAY_NAME" --parent "$CHAINGUARD_ORG" \
                 -f "$WORK/config.yaml" "${CERT_ARGS[@]}"
               note "created overlay \`$OVERLAY_NAME\`"
+              CHANGED=true
               CURRENT=$(list_overlay)
               ;;
             1)
               OVERLAY_ID=$(jq -r '.[0].id' <<<"$CURRENT")
-              STORED=$(jq -r --arg k "$DIGEST_ANNOTATION" '.[0].config.annotations[$k] // ""' <<<"$CURRENT")
+              STORED=$(jq -r --arg k "$DIGEST_KEY" '.[0].config.annotations[$k] // ""' <<<"$CURRENT")
               if [ "$STORED" = "$DIGEST" ]; then
                 note "overlay \`$OVERLAY_NAME\` unchanged"
               else
                 # -f replaces the stored config wholesale; certs merge into it.
                 chainctl images overlays update "$OVERLAY_ID" -f "$WORK/config.yaml" "${CERT_ARGS[@]}"
                 note "updated overlay \`$OVERLAY_NAME\` (digest ${STORED:-<none>} → $DIGEST)"
+                CHANGED=true
               fi
               ;;
             *)
@@ -333,9 +376,11 @@ jobs:
               chainctl images overlays attach --overlay "$OVERLAY_ID" --parent "$CHAINGUARD_ORG" \
                 "${TARGET_ARGS[@]}" "${SEL[@]}"
               note "attached → $target (${SEL[*]})"
+              CHANGED=true
             elif [ "$(jq -c '.sel' <<<"$match")" != "$(jq -c '.sel' <<<"$b")" ]; then
               chainctl images overlays update-binding "$(jq -r '.id' <<<"$match")" "${SEL[@]}"
               note "updated binding → $target (${SEL[*]})"
+              CHANGED=true
             else
               note "binding → $target unchanged"
             fi
@@ -358,5 +403,100 @@ jobs:
             echo ""
             for a in "${ACTIONS[@]}"; do echo "- $a"; done
             echo ""
-            echo "_Chainguard rebuilds affected tags asynchronously (orgs enrolled in overlay-based Custom Assembly only)._"
           } >> "$GITHUB_STEP_SUMMARY"
+
+          {
+            echo "changed=$CHANGED"
+            echo "digest=$DIGEST"
+            echo "digest_key=$DIGEST_KEY"
+            echo "before=$BEFORE"
+          } >> "$GITHUB_OUTPUT"
+
+      # Wait for the rebuilds this run triggered and fail if any did not
+      # succeed. A report counts when it (a) didn't exist in the pre-change
+      # snapshot and (b) carries this overlay's digest annotation with the
+      # value just applied — so unrelated rebuilds of the same repo (upstream
+      # package updates, other overlays) are ignored.
+      - name: Wait for rebuilds
+        if: steps.reconcile.outputs.changed == 'true' && steps.reconcile.outputs.before != '{}'
+        env:
+          BEFORE: ${{ steps.reconcile.outputs.before }}
+          DIGEST: ${{ steps.reconcile.outputs.digest }}
+          DIGEST_KEY: ${{ steps.reconcile.outputs.digest_key }}
+        run: |
+          set -euo pipefail
+          mapfile -t REPOS < <(jq -r 'keys[]' <<<"$BEFORE")
+
+          # Tolerate transient chainctl errors while polling — returning no
+          # reports just means "try again next tick" until the deadline.
+          matching_reports() {
+            local repo="$1"
+            { chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
+                --output json 2>/dev/null || echo '{"reports":[]}'; } \
+              | jq -c --arg r "$repo" --argjson before "$(jq -c --arg r "$repo" '.[$r]' <<<"$BEFORE")" \
+                      --arg k "$DIGEST_KEY" --arg d "$DIGEST" '
+                  [ (.reports // [])[]
+                    | select((.id as $i | $before | index($i)) | not)
+                    | (.config | fromjson? // {}) as $c
+                    | select(($c.annotations // {})[$k] == $d)
+                    | { repo: $r, id, startedAt, result,
+                        main: (($c.annotations // {})["dev.chainguard.package.main"] // "?"),
+                        # 3.13 and 3.13-dev share the same main package; -dev
+                        # images are told apart by shipping apk-tools.
+                        dev: (($c.contents.packages // []) | any(startswith("apk-tools"))),
+                        error: ((.log // "") | split("\n") | map(fromjson? | select(.level? == "ERROR") | .msg) | last // null) } ]'
+          }
+
+          echo "Waiting for rebuilds of ${REPOS[*]} carrying $DIGEST_KEY=$DIGEST ..."
+          START=$(date +%s)
+          DEADLINE=$(( START + REBUILD_TIMEOUT_SECONDS ))
+          LAST_CHANGE=$START
+          PREV_TOTAL=0
+          while :; do
+            ALL='[]'
+            for repo in "${REPOS[@]}"; do
+              ALL=$(jq -c --argjson more "$(matching_reports "$repo")" '. + $more' <<<"$ALL")
+            done
+            TOTAL=$(jq 'length' <<<"$ALL")
+            PENDING=$(jq '[.[] | select(.result == null)] | length' <<<"$ALL")
+            NOW=$(date +%s)
+            if [ "$TOTAL" -ne "$PREV_TOTAL" ]; then LAST_CHANGE=$NOW; PREV_TOTAL=$TOTAL; fi
+            echo "  [$(( NOW - START ))s] rebuild reports: total=$TOTAL pending=$PENDING"
+
+            if [ "$TOTAL" -eq 0 ] && [ $(( NOW - START )) -ge "$REBUILD_FIRST_REPORT_SECONDS" ]; then
+              echo "::warning::No rebuild of ${REPOS[*]} with this overlay appeared within ${REBUILD_FIRST_REPORT_SECONDS}s — nothing to check (no matching tags, or the org is not enrolled for overlay rebuilds)."
+              echo "_No rebuilds observed within ${REBUILD_FIRST_REPORT_SECONDS}s._" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            if [ "$TOTAL" -gt 0 ] && [ "$PENDING" -eq 0 ] && [ $(( NOW - LAST_CHANGE )) -ge "$REBUILD_SETTLE_SECONDS" ]; then
+              break
+            fi
+            if [ "$NOW" -ge "$DEADLINE" ]; then
+              echo "::error::Timed out after ${REBUILD_TIMEOUT_SECONDS}s waiting for rebuilds ($PENDING still pending)."
+              jq -r '.[] | "  \(.repo) \(.main) \(.result // "pending")"' <<<"$ALL" >&2
+              exit 1
+            fi
+            sleep 20
+          done
+
+          # Keep only the latest report per tag stream (repo + main package +
+          # dev): a stream can rebuild more than once in the window (e.g. an
+          # upstream base refresh), and the latest result is what's served.
+          LATEST=$(jq -c '
+            group_by([.repo, .main, .dev]) | map(sort_by(.startedAt) | last)
+            | map(. + {label: "\(.main)\(if .dev then " (-dev)" else "" end)"})
+            | sort_by(.repo, .label)' <<<"$ALL")
+          {
+            echo "#### Rebuilds"
+            echo ""
+            echo "| Repo | Image | Result |"
+            echo "| --- | --- | --- |"
+            jq -r '.[] | "| \(.repo) | \(.label) | \(if .result == "Success" then "✅" else "❌ \(.result)" end) |"' <<<"$LATEST"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          FAILED=$(jq -c '[.[] | select(.result != "Success")]' <<<"$LATEST")
+          if [ "$(jq length <<<"$FAILED")" -ne 0 ]; then
+            jq -r '.[] | "::error::Rebuild failed: \(.repo) \(.label) — \(.error // "see build log")"' <<<"$FAILED"
+            exit 1
+          fi
+          echo "All $(jq length <<<"$LATEST") rebuild(s) succeeded."
