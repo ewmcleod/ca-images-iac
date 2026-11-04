@@ -15,7 +15,7 @@ and where it applies is declared explicitly in its `bindings:`.
 | Unit | one config per repo | one reusable overlay, bound to many repos |
 | Targets | the file name / `<name>-<BU>` variant | declared in `bindings:` |
 | Tag scope | all tags | `all-tags`, `tag-variant: dev`, or `exact-tags` |
-| Build | workflow waits for build reports | Chainguard rebuilds matching tags asynchronously |
+| Build | one build, workflow waits for it | Chainguard rebuilds every matching tag; workflow waits for all of them |
 
 > **A repo can't use both.** Don't bind an overlay to a repo that the
 > `custom-assembly-build*.yml` workflows customize; `attach` will fail.
@@ -53,12 +53,19 @@ For each file:
 
 1. **Overlay** — creates it, or runs `update` when the content digest changes.
    The digest covers the config and all `certs/` files and is saved as the
-   `dev.ca-images-iac.overlay-digest` annotation, so unchanged overlays are
-   skipped and no rebuilds are triggered.
+   `dev.ca-images-iac.overlay-digest.<name>` annotation, so unchanged overlays
+   are skipped and no rebuilds are triggered.
 2. **Bindings** — `attach` new targets, `update-binding` changed selectors, and
    `detach` bindings of this overlay that the file no longer declares (set
    `PRUNE_BINDINGS` to anything other than `"true"` in `custom-assembly-overlay.yml`
    to only warn instead).
+3. **Rebuild check** — if step 1 or 2 changed anything, waits for the rebuilds
+   on each bound repo and fails if any tag stream's latest rebuild failed (e.g.
+   a templated package that doesn't exist for one Python version). Rebuilds
+   are matched by the overlay's digest annotation, which is copied into every
+   rebuilt image, so unrelated builds of the same repo are ignored. The job
+   summary shows a per-image result table. Tunables (`REBUILD_*`) are in the
+   workflow's `env:`. `all-repos` bindings are not checked.
 
 Not handled: deleting the overlay when its file is removed. Detach its bindings
 and run `chainctl images overlays delete <name>` by hand.
