@@ -8,7 +8,6 @@
 contents:
   packages:
     - "py{{major}}.{{minor}}-cryptography"
-    - "py{{major}}.{{minor}}-grpcio-1.84"
     - "py{{major}}.{{minor}}-psycopg2"
 
 bindings:

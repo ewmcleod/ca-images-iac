@@ -9,7 +9,6 @@
 contents:
   packages:
     - jq
-    - curl
 
 bindings:
   - repo: python-test-fips
