@@ -1,0 +1,362 @@
+name: Custom Assembly Overlay
+
+# Overlay-based Custom Assembly: *overlays* are org-level, reusable customizations
+# (packages, env, annotations, accounts, certificates) that are attached to
+# repos via *bindings* with a tag selector. Unlike `chainctl images repos build
+# apply`, nothing is built from a config directly: Chainguard rebuilds the
+# matching tags asynchronously whenever an overlay or binding changes.
+#
+# For every <OVERLAYS_DIR>/<name>.yaml this workflow reconciles an org-level
+# overlay named exactly "<name>" to match the file. There is no business-unit
+# routing: an overlay is shared, and where it applies is declared explicitly by
+# its `bindings:` rather than by a "<name>-<BU>" variant repo.
+#   1. create the overlay, or update it if its content digest changed
+#      (config + global CA certs from certs/)
+#   2. attach any declared binding that doesn't exist yet
+#   3. update-binding where the tag selector changed
+#   4. detach bindings of this overlay that are no longer declared
+#      (when PRUNE_BINDINGS is "true")
+#
+# NOTE: a repo cannot use both standard (legacy) Custom Assembly and overlays.
+# Don't bind overlays to repos that custom-assembly-build*.yml customize.
+
+on:
+  push:
+    # Restrict to main so branch/PR pushes don't change the shared org.
+    branches: [main]
+    paths:
+      # WARNING: keep in sync with env.OVERLAYS_DIR / env.CERTS_DIR below —
+      # `on:` can't reference env, so update both by hand.
+      - ca-overlays/**
+      - certs/**
+      - .github/workflows/custom-assembly-overlay.yml
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialize runs per ref: overlapping runs would race create/attach on the
+# same overlays. Never cancel a run mid-reconcile.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # One <name>.yaml (or .yml) overlay definition per file, directly under this
+  # directory. Subdirectories (e.g. examples/) are NOT scanned.
+  # WARNING: keep in sync with the `ca-overlays/**` path filter in
+  # on.push.paths above — `on:` can't reference env.
+  OVERLAYS_DIR: ca-overlays
+
+  # Global CA certificate directory — attached to EVERY overlay.
+  CERTS_DIR: certs
+
+  # Annotation stamped into each overlay's stored config holding a sha256 of
+  # the desired config + certificates. Lets a re-run detect "unchanged" and skip
+  # `overlays update`, which would otherwise trigger needless rebuilds.
+  DIGEST_ANNOTATION: dev.ca-images-iac.overlay-digest
+
+  # "true": detach bindings of a managed overlay that the file no longer
+  # declares (the file is the source of truth). Anything else: only warn.
+  PRUNE_BINDINGS: "true"
+
+jobs:
+  # ── Discover — one matrix entry per overlay file ──
+  discover:
+    name: Discover overlays
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+      has_overlays: ${{ steps.set.outputs.has_overlays }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build matrix from overlay files
+        id: set
+        env:
+          CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG }}
+          CHAINGUARD_IDENTITY: ${{ vars.CHAINGUARD_IDENTITY }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # Guard — skip gracefully (green, but loudly annotated) if Chainguard
+          # isn't configured, e.g. on an unconfigured fork.
+          MISSING=()
+          if [ -z "$CHAINGUARD_ORG" ];      then MISSING+=("CHAINGUARD_ORG"); fi
+          if [ -z "$CHAINGUARD_IDENTITY" ]; then MISSING+=("CHAINGUARD_IDENTITY"); fi
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            DOCS="https://edu.chainguard.dev/chainguard/administration/iam-organizations/assumable-ids/identity-examples/github-actions-identity/"
+            echo "::warning::Skipping overlay reconcile — required variable(s) not set: ${MISSING[*]}. See $DOCS"
+            {
+              echo "### Custom Assembly Overlays — skipped"
+              echo ""
+              echo "Nothing ran because these repository variable(s) are not set:"
+              for v in "${MISSING[@]}"; do echo "- \`$v\`"; done
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo 'has_overlays=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          resolve_yaml() {
+            local y="$1.yaml" m="$1.yml"
+            if [ -f "$y" ] && [ -f "$m" ]; then return 2; fi
+            if [ -f "$y" ]; then printf '%s' "$y"; return 0; fi
+            if [ -f "$m" ]; then printf '%s' "$m"; return 0; fi
+            return 1
+          }
+
+          mapfile -t names < <(
+            for f in "$OVERLAYS_DIR"/*.yaml "$OVERLAYS_DIR"/*.yml; do
+              b=$(basename "$f")
+              printf '%s\n' "${b%.*}"
+            done | sort -u
+          )
+          entries=()
+          for name in "${names[@]}"; do
+            resolved=$(resolve_yaml "$OVERLAYS_DIR/$name") && rc=0 || rc=$?
+            if [ "$rc" -eq 2 ]; then
+              echo "::error::$OVERLAYS_DIR has both ${name}.yaml and ${name}.yml — keep one. Skipping."; continue
+            fi
+            entries+=( "$(jq -nc --arg overlay "$name" --arg config "$resolved" \
+                          '{overlay: $overlay, config: $config}')" )
+          done
+
+          if [ ${#entries[@]} -eq 0 ]; then
+            echo "::warning::No overlay files under $OVERLAYS_DIR/ — nothing to reconcile."
+            echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
+            echo 'has_overlays=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          INCLUDE=$(printf '%s\n' "${entries[@]}" | jq -s -c '{include: .}')
+          echo "Discovered overlays:"
+          echo "$INCLUDE" | jq -r '.include[] | "  - \(.overlay)  (config: \(.config))"'
+          echo "matrix=$INCLUDE" >> "$GITHUB_OUTPUT"
+          echo 'has_overlays=true' >> "$GITHUB_OUTPUT"
+
+  # ── Reconcile — one isolated job per overlay (fail-fast: false) ──
+  reconcile:
+    name: Overlay ${{ matrix.overlay }}
+    needs: discover
+    if: needs.discover.outputs.has_overlays == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write     # OIDC auth with chainctl
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+
+    env:
+      CHAINGUARD_ORG: ${{ vars.CHAINGUARD_ORG }}
+      OVERLAY_NAME: ${{ matrix.overlay }}
+      CONFIG_FILE: ${{ matrix.config }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Validate the `bindings:` block and normalize it to JSON:
+      #   [{target: "repo:<name>"|"all-repos", repo, all_repos, sel: {kind, tags}}]
+      # Rules per binding: exactly one of `repo` / `all-repos: true`; exactly
+      # one of `all-tags: true` / `tag-variant: dev` / `exact-tags: [...]`;
+      # exact tags must be YAML strings (unquoted 3.10 would parse as 3.1);
+      # no two bindings may target the same repo (an overlay attaches to a
+      # repo only once).
+      - name: Validate bindings
+        id: bindings
+        run: |
+          set -euo pipefail
+
+          if [ "$(yq '(.bindings // []) | tag' "$CONFIG_FILE")" != "!!seq" ]; then
+            echo "::error::$CONFIG_FILE: 'bindings' must be a list."; exit 1
+          fi
+          BAD_TAGS=$(yq '[(.bindings // [])[] | (.["exact-tags"] // [])[] | select(tag != "!!str")] | length' "$CONFIG_FILE")
+          if [ "$BAD_TAGS" -ne 0 ]; then
+            echo "::error::$CONFIG_FILE: every exact-tags entry must be a quoted string (e.g. \"3.10\", not 3.10)."; exit 1
+          fi
+
+          RAW=$(yq -o json -I0 '.bindings // []' "$CONFIG_FILE")
+          ERRORS=$(jq -r '
+            to_entries[] | .key as $i | .value as $b
+            | ( [ ($b.repo // null | . != null), ($b["all-repos"] == true) ] | map(select(.)) | length ) as $t
+            | ( [ ($b["all-tags"] == true), ($b["tag-variant"] // null | . != null),
+                  (($b["exact-tags"] // []) | length > 0) ] | map(select(.)) | length ) as $s
+            | (if $t != 1 then "binding[\($i)]: set exactly one of repo / all-repos: true" else empty end),
+              (if $s != 1 then "binding[\($i)]: set exactly one of all-tags: true / tag-variant / exact-tags" else empty end),
+              (if ($b["tag-variant"] // "dev") != "dev" then "binding[\($i)]: tag-variant only supports \"dev\"" else empty end)
+          ' <<<"$RAW")
+          if [ -n "$ERRORS" ]; then
+            while IFS= read -r e; do echo "::error::$CONFIG_FILE: $e"; done <<<"$ERRORS"
+            exit 1
+          fi
+
+          DESIRED=$(jq -c '
+            map({
+              target:    (if .["all-repos"] == true then "all-repos" else "repo:\(.repo)" end),
+              repo:      (if .["all-repos"] == true then null else (.repo | tostring) end),
+              all_repos: (.["all-repos"] == true),
+              sel: (if .["all-tags"] == true then {kind: "KIND_ALL", tags: []}
+                    elif .["tag-variant"] then {kind: "KIND_VARIANT", tags: []}
+                    else {kind: "KIND_EXACT", tags: (.["exact-tags"] | map(tostring) | unique)} end)
+            })' <<<"$RAW")
+          DUPES=$(jq -r 'group_by(.target)[] | select(length > 1) | .[0].target' <<<"$DESIRED")
+          if [ -n "$DUPES" ]; then
+            echo "::error::$CONFIG_FILE: more than one binding targets: $DUPES — an overlay attaches to a repo only once."; exit 1
+          fi
+          if [ "$(jq length <<<"$DESIRED")" -eq 0 ]; then
+            echo "::warning::$CONFIG_FILE declares no bindings — the overlay will exist but apply to nothing."
+          fi
+          echo "Desired bindings:"; jq -r '.[] | "  - \(.target)  \(.sel.kind) \(.sel.tags | join(","))"' <<<"$DESIRED"
+          echo "desired=$DESIRED" >> "$GITHUB_OUTPUT"
+
+      - name: Setup chainctl
+        uses: chainguard-dev/setup-chainctl@2cddd35a2f120d9973e58094dc6878c93cf58c28 # v0.5.1
+        with:
+          identity: ${{ vars.CHAINGUARD_IDENTITY }}
+
+      - name: Reconcile overlay + bindings
+        env:
+          DESIRED: ${{ steps.bindings.outputs.desired }}
+        run: |
+          set -euo pipefail
+          WORK=$(mktemp -d)
+          ACTIONS=()
+          note() { echo "$1"; ACTIONS+=("$1"); }
+
+          # ── Desired overlay config: the file minus `bindings` ──
+          yq 'del(.bindings)' "$CONFIG_FILE" > "$WORK/config.yaml"
+
+          # Global CA certificates (passed as one comma-separated flag).
+          CERTS=()
+          if [ -n "$CERTS_DIR" ] && [ -d "$CERTS_DIR" ]; then
+            while IFS= read -r -d '' cert; do
+              case "$cert" in *,*)
+                echo "::error::Certificate path '$cert' contains a comma — --with-certificates is comma-separated. Rename it."; exit 1;;
+              esac
+              CERTS+=("$cert")
+            done < <(find "$CERTS_DIR" -type f \
+                        \( -iname '*.pem' -o -iname '*.crt' -o -iname '*.cer' -o -iname '*.ca' \) \
+                        -print0 | sort -z)
+          fi
+          echo "Found ${#CERTS[@]} CA certificate(s)."
+          CERT_ARGS=()
+          if [ ${#CERTS[@]} -gt 0 ]; then
+            CERT_ARGS=( --with-certificates "$(IFS=,; echo "${CERTS[*]}")" )
+          fi
+
+          # Content digest over canonicalized config + cert names/contents,
+          # stamped into the config so a re-run can detect "no change".
+          DIGEST=$(
+            {
+              yq -o json -I0 'sort_keys(..)' "$WORK/config.yaml"
+              for c in "${CERTS[@]}"; do printf '%s\n' "$c"; sha256sum < "$c"; done
+            } | sha256sum | cut -d' ' -f1
+          )
+          DIGEST="$DIGEST" yq -i '.annotations[strenv(DIGEST_ANNOTATION)] = strenv(DIGEST)' "$WORK/config.yaml"
+          echo "Desired overlay digest: $DIGEST"
+
+          list_overlay() {
+            chainctl images overlays list --parent "$CHAINGUARD_ORG" -o json \
+              | jq -c --arg n "$OVERLAY_NAME" '[(.overlays // [])[] | select(.name == $n)]'
+          }
+
+          # ── 1. Create or update the overlay ──
+          CURRENT=$(list_overlay)
+          case "$(jq length <<<"$CURRENT")" in
+            0)
+              chainctl images overlays create "$OVERLAY_NAME" --parent "$CHAINGUARD_ORG" \
+                -f "$WORK/config.yaml" "${CERT_ARGS[@]}"
+              note "created overlay \`$OVERLAY_NAME\`"
+              CURRENT=$(list_overlay)
+              ;;
+            1)
+              OVERLAY_ID=$(jq -r '.[0].id' <<<"$CURRENT")
+              STORED=$(jq -r --arg k "$DIGEST_ANNOTATION" '.[0].config.annotations[$k] // ""' <<<"$CURRENT")
+              if [ "$STORED" = "$DIGEST" ]; then
+                note "overlay \`$OVERLAY_NAME\` unchanged"
+              else
+                # -f replaces the stored config wholesale; certs merge into it.
+                chainctl images overlays update "$OVERLAY_ID" -f "$WORK/config.yaml" "${CERT_ARGS[@]}"
+                note "updated overlay \`$OVERLAY_NAME\` (digest ${STORED:-<none>} → $DIGEST)"
+              fi
+              ;;
+            *)
+              echo "::error::Multiple overlays named '$OVERLAY_NAME' in $CHAINGUARD_ORG — resolve by hand."; exit 1
+              ;;
+          esac
+          if [ "$(jq length <<<"$CURRENT")" -ne 1 ]; then
+            echo "::error::Overlay '$OVERLAY_NAME' not found after create."; exit 1
+          fi
+          OVERLAY_ID=$(jq -r '.[0].id' <<<"$CURRENT")
+
+          # ── 2–4. Reconcile bindings ──
+          # Normalize existing bindings to the same shape as DESIRED. The kind
+          # is matched loosely (ALL / VARIANT / EXACT substring) so enum naming
+          # differences in the API don't cause perpetual update-binding churn.
+          EXISTING=$(jq -c '
+            [.[0].bindings // [] | .[] | {
+              id,
+              target: (if .all_repos then "all-repos" else "repo:\(.repo.name)" end),
+              sel: {
+                kind: ((.selector.kind // "") as $k
+                       | if   ($k | test("EXACT"))   then "KIND_EXACT"
+                         elif ($k | test("VARIANT")) then "KIND_VARIANT"
+                         elif ($k | test("ALL"))     then "KIND_ALL"
+                         else $k end),
+                tags: ((.selector.tags // []) | unique)
+              }
+            }]' <<<"$CURRENT")
+
+          selector_args() {
+            jq -r '.sel | if .kind == "KIND_ALL" then "--all-tags"
+                          elif .kind == "KIND_VARIANT" then "--tag-variant=dev"
+                          else (.tags[] | "--exact-tag=\(.)") end' <<<"$1"
+          }
+
+          while IFS= read -r b; do
+            [ -n "$b" ] || continue
+            target=$(jq -r '.target' <<<"$b")
+            match=$(jq -c --arg t "$target" 'map(select(.target == $t)) | first // empty' <<<"$EXISTING")
+            mapfile -t SEL < <(selector_args "$b")
+            if [ -z "$match" ]; then
+              TARGET_ARGS=( --all-repos )
+              if [ "$(jq -r '.all_repos' <<<"$b")" != "true" ]; then
+                TARGET_ARGS=( --repo "$(jq -r '.repo' <<<"$b")" )
+              fi
+              chainctl images overlays attach --overlay "$OVERLAY_ID" --parent "$CHAINGUARD_ORG" \
+                "${TARGET_ARGS[@]}" "${SEL[@]}"
+              note "attached → $target (${SEL[*]})"
+            elif [ "$(jq -c '.sel' <<<"$match")" != "$(jq -c '.sel' <<<"$b")" ]; then
+              chainctl images overlays update-binding "$(jq -r '.id' <<<"$match")" "${SEL[@]}"
+              note "updated binding → $target (${SEL[*]})"
+            else
+              note "binding → $target unchanged"
+            fi
+          done < <(jq -c '.[]' <<<"$DESIRED")
+
+          while IFS= read -r stale; do
+            [ -n "$stale" ] || continue
+            sid=$(jq -r '.id' <<<"$stale"); st=$(jq -r '.target' <<<"$stale")
+            if [ "$PRUNE_BINDINGS" = "true" ]; then
+              chainctl images overlays detach "$sid"
+              note "detached undeclared binding → $st"
+            else
+              echo "::warning::Overlay '$OVERLAY_NAME' has undeclared binding → $st ($sid); PRUNE_BINDINGS is off, leaving it."
+            fi
+          done < <(jq -c --argjson d "$DESIRED" \
+                     '.[] | select(.target as $t | ($d | map(.target) | index($t)) | not)' <<<"$EXISTING")
+
+          {
+            echo "### Overlay \`$OVERLAY_NAME\`"
+            echo ""
+            for a in "${ACTIONS[@]}"; do echo "- $a"; done
+            echo ""
+            echo "_Chainguard rebuilds affected tags asynchronously (orgs enrolled in overlay-based Custom Assembly only)._"
+          } >> "$GITHUB_STEP_SUMMARY"
