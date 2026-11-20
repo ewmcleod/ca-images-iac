@@ -71,8 +71,13 @@ env:
   # An overlay that still has no report once the repo has been idle for
   # REBUILD_FIRST_REPORT_SECONDS is warned about and skipped (e.g. an
   # exact-tags binding to tags that don't exist yet produces no builds).
+  # A repo created by this run (binding `source:`) is different: it can sit
+  # with no build reports at all while Chainguard provisions it, so idleness
+  # means nothing. Until its first matching report it's waited on for up to
+  # REBUILD_NEW_REPO_FIRST_REPORT_SECONDS, and FAILS if none appears.
   REBUILD_TIMEOUT_SECONDS: "2700"
   REBUILD_FIRST_REPORT_SECONDS: "300"
+  REBUILD_NEW_REPO_FIRST_REPORT_SECONDS: "1200"
   REBUILD_SETTLE_SECONDS: "90"
 
   # "true": detach bindings of a managed overlay that the file no longer
@@ -262,6 +267,7 @@ jobs:
           DIGEST_KEY="${DIGEST_ANNOTATION_PREFIX}.${OVERLAY_NAME}"
           DIGEST=""
           BEFORE='{}'
+          CREATED='[]'      # repos created in step 0 (rebuild check waits longer on them)
 
           # Hand-off to the rebuild-check job, written on ANY exit so a run
           # that fails after already changing the overlay still gets checked.
@@ -270,8 +276,9 @@ jobs:
           write_result() {
             jq -n --arg overlay "$OVERLAY_NAME" --argjson changed "$CHANGED" \
                   --arg digest_key "$DIGEST_KEY" --arg digest "$DIGEST" --argjson before "$BEFORE" \
+                  --argjson created "$CREATED" \
                   '{overlay: $overlay, changed: $changed, digest_key: $digest_key,
-                    digest: $digest, before: $before}' > "$RESULT_DIR/$OVERLAY_NAME.json"
+                    digest: $digest, before: $before, created: $created}' > "$RESULT_DIR/$OVERLAY_NAME.json"
           }
           trap write_result EXIT
 
@@ -341,6 +348,7 @@ jobs:
             else
               echo "::error::Failed to create repo '$repo' from '$source'."; exit 1
             fi
+            CREATED=$(jq -c --arg r "$repo" '. + [$r]' <<<"$CREATED")
           done < <(jq -c '.[] | select(.all_repos | not)' <<<"$DESIRED")
 
           # Snapshot existing build report IDs on every bound repo BEFORE any
@@ -353,10 +361,19 @@ jobs:
           # report as pre-existing only if it is in EVERY changed overlay's
           # snapshot for that repo.
           # all-repos bindings are not checked (unbounded repo set).
+          # A repo that has never built (e.g. one just created in step 0) makes
+          # `build list` exit non-zero with "no build reports found": that's an
+          # empty snapshot, not an error. Any other failure still fails.
           while IFS= read -r repo; do
             [ -n "$repo" ] || continue
-            ids=$(chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
-                    --output json | jq -c '[(.reports // [])[].id]')
+            if out=$(chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
+                       --output json 2>"$WORK/build-list.err"); then
+              ids=$(jq -c '[(.reports // [])[].id]' <<<"$out")
+            elif grep -q 'no build reports found' - "$WORK/build-list.err" <<<"$out"; then
+              ids='[]'
+            else
+              echo "::error::Can't list build reports for repo '$repo': $out $(cat "$WORK/build-list.err")"; exit 1
+            fi
             BEFORE=$(jq -c --arg r "$repo" --argjson ids "$ids" '. + {($r): $ids}' <<<"$BEFORE")
           done < <(jq -r '.[] | select(.all_repos | not) | .repo' <<<"$DESIRED")
           if jq -e 'any(.all_repos)' <<<"$DESIRED" >/dev/null; then
@@ -516,21 +533,24 @@ jobs:
             echo "No reconcile results — nothing to check."
             echo "has_work=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
+          # `new`: some overlay job created the repo in this run.
           jq -s -c '
-            [ .[] | select(.changed and .digest != "")
-              | {name: .overlay, key: .digest_key, digest: .digest} as $o
-              | .before | to_entries[] | {repo: .key, before: .value, overlay: $o} ]
+            ([.[] | (.created // [])[]] | unique) as $created
+            | [ .[] | select(.changed and .digest != "")
+                | {name: .overlay, key: .digest_key, digest: .digest} as $o
+                | .before | to_entries[] | {repo: .key, before: .value, overlay: $o} ]
             | group_by(.repo)
-            | map({ (.[0].repo): {
+            | map(.[0].repo as $r | { ($r): {
                       overlays: map(.overlay),
-                      before: (map(.before) | reduce .[1:][] as $b (.[0]; . - (. - $b))) } })
+                      before: (map(.before) | reduce .[1:][] as $b (.[0]; . - (. - $b))),
+                      new: ($created | index($r) != null) } })
             | add // {}' "${files[@]}" > "$RUNNER_TEMP/rebuild-plan.json"
           if [ "$(jq length "$RUNNER_TEMP/rebuild-plan.json")" -eq 0 ]; then
             echo "No overlay changes that trigger checked rebuilds."
             echo "has_work=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
           echo "Rebuilds to check:"
-          jq -r 'to_entries[] | "  - \(.key): \(.value.overlays | map(.name) | join(", "))"' "$RUNNER_TEMP/rebuild-plan.json"
+          jq -r 'to_entries[] | "  - \(.key)\(if .value.new then " (new repo)" else "" end): \(.value.overlays | map(.name) | join(", "))"' "$RUNNER_TEMP/rebuild-plan.json"
           echo "has_work=true" >> "$GITHUB_OUTPUT"
 
       - name: Setup chainctl
@@ -555,12 +575,16 @@ jobs:
           mapfile -t REPOS < <(jq -r 'keys[]' <<<"$PLAN")
 
           # New reports on a repo as {id: report}. Tolerates transient chainctl
-          # errors — no reports just means "try again next tick".
+          # errors — no reports just means "try again next tick". On failure the
+          # output is discarded, not appended to: for a repo that has never
+          # built, chainctl prints {"error":"no build reports found"} on STDOUT
+          # before exiting non-zero, which would otherwise reach jq as a second
+          # JSON document.
           fetch_new() {
-            local repo="$1"
-            { chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
-                --output json 2>/dev/null || echo '{"reports":[]}'; } \
-              | jq -c --arg r "$repo" --argjson p "$(jq -c --arg r "$repo" '.[$r]' <<<"$PLAN")" '
+            local repo="$1" out
+            out=$(chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
+                    --output json 2>/dev/null) || out='{"reports":[]}'
+            jq -c --arg r "$repo" --argjson p "$(jq -c --arg r "$repo" '.[$r]' <<<"$PLAN")" '
                   [ (.reports // [])[]
                     | select(.id as $i | $p.before | any(.[]; . == $i) | not)
                     | (.config | fromjson? // {}) as $c
@@ -573,11 +597,12 @@ jobs:
                         # images are told apart by shipping apk-tools.
                         dev: (($c.contents.packages // []) | any(startswith("apk-tools"))),
                         error: ((.log // "") | split("\n") | map(fromjson? | select(.level? == "ERROR") | .msg) | last // null) } ]
-                  | map({(.id): .}) | add // {}'
+                  | map({(.id): .}) | add // {}' <<<"$out"
           }
 
           SEEN='{}'          # {repo: {id: report}}
           declare -A SIG LAST_CHANGE FINISHED
+          NEW_REPO_FAILED=()
           START=$(date +%s)
           DEADLINE=$(( START + REBUILD_TIMEOUT_SECONDS ))
           for repo in "${REPOS[@]}"; do LAST_CHANGE[$repo]=$START; done
@@ -603,7 +628,19 @@ jobs:
               mapfile -t MISSING < <(jq -r --argjson p "$(jq -c --arg r "$repo" '.[$r]' <<<"$PLAN")" '
                 . as $all | $p.overlays[].name
                 | select(. as $n | $all | any(.[]; .overlays | any(.[]; . == $n)) | not)' <<<"$R")
-              echo "  [$(( NOW - START ))s] $repo: new=$(jq length <<<"$R") matched=$MATCHED pending=$PENDING idle=${IDLE}s${MISSING[0]:+ waiting-for=${MISSING[*]}}"
+              NEW_REPO=$(jq -r --arg r "$repo" '.[$r].new // false' <<<"$PLAN")
+              echo "  [$(( NOW - START ))s] $repo$([ "$NEW_REPO" = true ] && echo " (new repo)"): new=$(jq length <<<"$R") matched=$MATCHED pending=$PENDING idle=${IDLE}s${MISSING[0]:+ waiting-for=${MISSING[*]}}"
+
+              # A repo created this run can have no reports at all for a while,
+              # so until its first matching build, idleness proves nothing:
+              # keep waiting, and fail (not warn) if none ever appears.
+              if [ "$NEW_REPO" = true ] && [ "$MATCHED" -eq 0 ]; then
+                if [ $(( NOW - START )) -ge "$REBUILD_NEW_REPO_FIRST_REPORT_SECONDS" ]; then
+                  echo "::error::$repo: repo was created by this run but no build carrying ${MISSING[*]} appeared within ${REBUILD_NEW_REPO_FIRST_REPORT_SECONDS}s."
+                  NEW_REPO_FAILED+=("$repo"); FINISHED[$repo]=1; continue
+                fi
+                ALL_DONE=false; continue
+              fi
 
               if [ "$PENDING" -eq 0 ] && [ "$IDLE" -ge "$REBUILD_SETTLE_SECONDS" ]; then
                 if [ ${#MISSING[@]} -eq 0 ]; then
@@ -651,6 +688,7 @@ jobs:
             done
             RC=1
           fi
+          [ ${#NEW_REPO_FAILED[@]} -eq 0 ] || RC=1
           FAILED=$(jq -c '[.[] | select(.result != null and .result != "Success")]' <<<"$LATEST")
           if [ "$(jq length <<<"$FAILED")" -ne 0 ]; then
             jq -r '.[] | "::error::Rebuild failed: \(.repo) \(.label) [\(.overlays | join(", "))] — \(.error // "see build log")"' <<<"$FAILED"

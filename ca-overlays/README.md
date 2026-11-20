@@ -87,5 +87,11 @@ For each file:
    overlays each image's build carried. Tunables (`REBUILD_*`) are in the
    workflow's `env:`. `all-repos` bindings are not checked.
 
+   A repo **created by the run** (via `source:`) can have no build reports at
+   all for a while, so being idle doesn't mean nothing is coming. The check
+   waits up to `REBUILD_NEW_REPO_FIRST_REPORT_SECONDS` (20 min) for its first
+   rebuild carrying the overlay, and **fails** if none appears. Once that
+   first build is in, the normal rules apply.
+
 Not handled: deleting the overlay when its file is removed. Detach its bindings
 and run `chainctl images overlays delete <name>` by hand.
