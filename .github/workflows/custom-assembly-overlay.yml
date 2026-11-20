@@ -184,12 +184,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Validate the `bindings:` block and normalize it to JSON:
-      #   [{target: "repo:<name>"|"all-repos", repo, all_repos, sel: {kind, tags}}]
+      #   [{target: "repo:<name>"|"all-repos", repo, all_repos, source, sel: {kind, tags}}]
       # Rules per binding: exactly one of `repo` / `all-repos: true`; exactly
       # one of `all-tags: true` / `tag-variant: dev` / `exact-tags: [...]`;
       # exact tags must be YAML strings (unquoted 3.10 would parse as 3.1);
-      # no two bindings may target the same repo (an overlay attaches to a
-      # repo only once).
+      # `source` (catalog image name to create the repo from when it doesn't
+      # exist yet) only with `repo`; no two bindings may target the same repo
+      # (an overlay attaches to a repo only once).
       - name: Validate bindings
         id: bindings
         run: |
@@ -211,7 +212,9 @@ jobs:
                   (($b["exact-tags"] // []) | length > 0) ] | map(select(.)) | length ) as $s
             | (if $t != 1 then "binding[\($i)]: set exactly one of repo / all-repos: true" else empty end),
               (if $s != 1 then "binding[\($i)]: set exactly one of all-tags: true / tag-variant / exact-tags" else empty end),
-              (if ($b["tag-variant"] // "dev") != "dev" then "binding[\($i)]: tag-variant only supports \"dev\"" else empty end)
+              (if ($b["tag-variant"] // "dev") != "dev" then "binding[\($i)]: tag-variant only supports \"dev\"" else empty end),
+              (if $b.source != null and ($b.source | type) != "string" then "binding[\($i)]: source must be a catalog image name (string)" else empty end),
+              (if $b.source != null and $b["all-repos"] == true then "binding[\($i)]: source only applies to a repo binding, not all-repos" else empty end)
           ' <<<"$RAW")
           if [ -n "$ERRORS" ]; then
             while IFS= read -r e; do echo "::error::$CONFIG_FILE: $e"; done <<<"$ERRORS"
@@ -223,6 +226,7 @@ jobs:
               target:    (if .["all-repos"] == true then "all-repos" else "repo:\(.repo)" end),
               repo:      (if .["all-repos"] == true then null else (.repo | tostring) end),
               all_repos: (.["all-repos"] == true),
+              source:    (.source // null),
               sel: (if .["all-tags"] == true then {kind: "KIND_ALL", tags: []}
                     elif .["tag-variant"] then {kind: "KIND_VARIANT", tags: []}
                     else {kind: "KIND_EXACT", tags: (.["exact-tags"] | map(tostring) | unique)} end)
@@ -234,7 +238,7 @@ jobs:
           if [ "$(jq length <<<"$DESIRED")" -eq 0 ]; then
             echo "::warning::$CONFIG_FILE declares no bindings — the overlay will exist but apply to nothing."
           fi
-          echo "Desired bindings:"; jq -r '.[] | "  - \(.target)  \(.sel.kind) \(.sel.tags | join(","))"' <<<"$DESIRED"
+          echo "Desired bindings:"; jq -r '.[] | "  - \(.target)  \(.sel.kind) \(.sel.tags | join(","))\(if .source then "  (source: \(.source))" else "" end)"' <<<"$DESIRED"
           echo "desired=$DESIRED" >> "$GITHUB_OUTPUT"
 
       - name: Setup chainctl
@@ -303,6 +307,41 @@ jobs:
           DIGEST="$DIGEST" DIGEST_KEY="$DIGEST_KEY" \
             yq -i '.annotations[strenv(DIGEST_KEY)] = strenv(DIGEST)' "$WORK/config.yaml"
           echo "Desired overlay digest: $DIGEST_KEY=$DIGEST"
+
+          # ── 0. Make sure every bound repo exists ──
+          # A binding with `source:` gets its repo created from that catalog
+          # image when it's missing (the repo name may differ from the source).
+          # The source is checked against the catalog first so a typo fails
+          # here with a clear message instead of in `repos create`. A missing
+          # repo with no `source:` is an error: `attach` would fail on it.
+          org_repos() {
+            chainctl images repos list --parent "$CHAINGUARD_ORG" -o json | jq -c '[(.items // [])[].name]'
+          }
+          REPOS_NOW=$(org_repos)
+          while IFS= read -r b; do
+            [ -n "$b" ] || continue
+            repo=$(jq -r '.repo' <<<"$b"); source=$(jq -r '.source // ""' <<<"$b")
+            if jq -e --arg r "$repo" 'index($r) != null' <<<"$REPOS_NOW" >/dev/null; then
+              continue
+            fi
+            if [ -z "$source" ]; then
+              echo "::error::$CONFIG_FILE: repo '$repo' does not exist in $CHAINGUARD_ORG. Add \`source: <catalog image>\` to its binding to create it."; exit 1
+            fi
+            # `catalog --name` is a prefix match (amazon-corretto-jre also
+            # returns amazon-corretto-jre-fips) — require the exact name.
+            if ! chainctl images catalog --name "$source" -o json \
+                   | jq -e --arg s "$source" 'any(.[]; .name == $s)' >/dev/null; then
+              echo "::error::$CONFIG_FILE: source '$source' for repo '$repo' is not in the Chainguard catalog (check \`chainctl images catalog --name $source\`)."; exit 1
+            fi
+            if chainctl images repos create "$repo" --source "$source" --parent "$CHAINGUARD_ORG"; then
+              note "created repo \`$repo\` from catalog image \`$source\`"
+            elif jq -e --arg r "$repo" 'index($r) != null' <<<"$(org_repos)" >/dev/null; then
+              # Another overlay job binding the same new repo created it first.
+              note "repo \`$repo\` was created concurrently by another overlay job"
+            else
+              echo "::error::Failed to create repo '$repo' from '$source'."; exit 1
+            fi
+          done < <(jq -c '.[] | select(.all_repos | not)' <<<"$DESIRED")
 
           # Snapshot existing build report IDs on every bound repo BEFORE any
           # change, so the rebuild check only counts reports created after it.

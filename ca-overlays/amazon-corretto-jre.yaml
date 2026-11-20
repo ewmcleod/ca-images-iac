@@ -1,0 +1,14 @@
+# Runtime extras for amazon-corretto-jre: timezone data and the C++ runtime
+# (needed by JNI libraries built against libstdc++).
+contents:
+  packages:
+    - tzdata
+    - libstdc++
+
+bindings:
+  - repo: amazon-corretto-jre
+    # Catalog image to create the repo from if it doesn't exist in the org
+    # yet (`chainctl images catalog --name amazon-corretto-jre`). The repo
+    # name above can be anything; source is the catalog name.
+    source: amazon-corretto-jre
+    all-tags: true
