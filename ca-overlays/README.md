@@ -39,6 +39,9 @@ bindings:
     exact-tags: ["3.13", "3.13-dev"]     # quote tags!
   - repo: flink
     tag-variant: dev
+  - repo: corretto-jre                    # repo name can be anything...
+    source: amazon-corretto-jre           # ...created from this catalog image if missing
+    all-tags: true
   - all-repos: true                       # every repo in the org, incl. future ones
     all-tags: true
 ```
@@ -47,10 +50,18 @@ Everything except `bindings:` is passed to `chainctl images overlays create/upda
 Each binding needs exactly one target (`repo` or `all-repos: true`) and exactly
 one selector (`all-tags: true`, `tag-variant: dev`, or `exact-tags`).
 
+A `repo` binding may also set `source:`, the catalog image to create the repo
+from when it doesn't exist in the org yet. Check the name with
+`chainctl images catalog --name <image>`. The repo is created with
+`chainctl images repos create <repo> --source <source>` before anything is
+attached, and left alone once it exists. Without `source:`, a missing repo is
+an error.
+
 ## What a run does
 
 For each file:
 
+0. **Repos** — creates any bound repo that is missing and has a `source:`.
 1. **Overlay** — creates it, or runs `update` when the content digest changes.
    The digest covers the config and all `certs/` files and is saved as the
    `dev.ca-images-iac.overlay-digest.<name>` annotation, so unchanged overlays
