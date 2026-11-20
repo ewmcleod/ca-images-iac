@@ -353,10 +353,19 @@ jobs:
           # report as pre-existing only if it is in EVERY changed overlay's
           # snapshot for that repo.
           # all-repos bindings are not checked (unbounded repo set).
+          # A repo that has never built (e.g. one just created in step 0) makes
+          # `build list` exit non-zero with "no build reports found": that's an
+          # empty snapshot, not an error. Any other failure still fails.
           while IFS= read -r repo; do
             [ -n "$repo" ] || continue
-            ids=$(chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
-                    --output json | jq -c '[(.reports // [])[].id]')
+            if out=$(chainctl images repos build list --parent "$CHAINGUARD_ORG" --repo "$repo" \
+                       --output json 2>"$WORK/build-list.err"); then
+              ids=$(jq -c '[(.reports // [])[].id]' <<<"$out")
+            elif grep -q 'no build reports found' - "$WORK/build-list.err" <<<"$out"; then
+              ids='[]'
+            else
+              echo "::error::Can't list build reports for repo '$repo': $out $(cat "$WORK/build-list.err")"; exit 1
+            fi
             BEFORE=$(jq -c --arg r "$repo" --argjson ids "$ids" '. + {($r): $ids}' <<<"$BEFORE")
           done < <(jq -r '.[] | select(.all_repos | not) | .repo' <<<"$DESIRED")
           if jq -e 'any(.all_repos)' <<<"$DESIRED" >/dev/null; then
